@@ -33,17 +33,39 @@ curl -X POST -d 'hi' localhost:4242/submit
 ruby bin/spin-serve --wasm ./handler.wasm
 ```
 
-## the handler contract
+## the handler — sinatra-flat, compiles to C
 
 ```ruby
-# ENV carries request metadata, stdin the body, stdout the response.
-# use bare `gets` (not STDIN.gets) — see docs/spike-handler.md.
-method = ENV["REQUEST_METHOD"] || "GET"
-puts "Status: 200"
-puts "Content-Type: text/plain"
-puts ""
-puts "hello"
+require_relative "spin"
+
+method, path = spin_request
+
+if spin_get?(method, path, "/")
+  spin_text(200, "hello from spin")
+
+elsif spin_get?(method, path, "/hi/:name")
+  spin_text(200, "hi #{spin_param("/hi/:name", path)}")
+
+elsif spin_post?(method, path, "/echo")
+  spin_text(201, "you said: #{spin_body}")
+
+else
+  spin_text(404, "not found: #{method} #{path}")
+end
 ```
+
+the whole routing surface is in [`spin.rb`](spin.rb): `spin_request`,
+`spin_get?/post?/put?/delete?`, `spin_match?`, `spin_param`, `spin_body`,
+`spin_text/json/html`. it reads like sinatra and AOT-compiles via spinel to
+a ~26KB binary.
+
+### why if/elsif and not `get("/x") { ... }`
+
+spinel infers homogeneous, typed structures and has no runtime proc-table.
+a sinatra-style block registry doesn't compile. the flat if/elsif dispatch
+is the closest thing that does — same legibility, no runtime indirection.
+the contract stays CGI: `ENV` (request meta) + `stdin` (body) → `stdout`
+(response). use bare `gets`, not `STDIN.gets` (see docs/spike-handler.md).
 
 ## github-as-substrate transport
 
