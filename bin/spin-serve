@@ -1,0 +1,115 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# spin-serve — the HTTP→CGI adapter.
+#
+# turns a spin handler (a spinel-compiled binary, or a .wasm run under
+# wasmtime) into a real URL. for each HTTP request it:
+#
+#   1. maps the request to the CGI contract:
+#        ENV  ← REQUEST_METHOD, PATH_INFO, QUERY_STRING, HTTP_* headers
+#        stdin ← the request body
+#   2. spawns the handler (fresh process per request — cold start is ~ms)
+#   3. maps the handler's stdout back to an HTTP response:
+#        "Status: NNN" + headers + blank line + body  (CGI response)
+#
+# usage:
+#   spin-serve ./handler                 # native binary
+#   spin-serve --wasm ./handler.wasm     # wasm via wasmtime
+#   PORT=8080 spin-serve ./handler
+#
+# this is the adapter from the PRD's architecture sketch: the only
+# transport-specific moving part. the handler never changes.
+
+require 'webrick'
+require 'open3'
+
+WASM     = ARGV.delete('--wasm')
+HANDLER  = ARGV.shift or abort "usage: spin-serve [--wasm] <handler|handler.wasm>"
+PORT     = (ENV['PORT'] || 4242).to_i
+WASMTIME = ENV['WASMTIME'] || File.expand_path('~/.wasmtime/bin/wasmtime')
+
+abort "handler not found: #{HANDLER}" unless File.exist?(HANDLER)
+
+# build argv + the env the handler will see
+def invoke_command(env_pairs)
+  if WASM
+    # wasmtime needs each guest env var passed explicitly via --env
+    cmd = [WASMTIME, 'run']
+    env_pairs.each { |k, v| cmd << '--env' << "#{k}=#{v}" }
+    cmd << HANDLER
+    [cmd, {}] # env already injected as flags
+  else
+    # native: pass env directly to the child process
+    [[File.expand_path(HANDLER)], env_pairs]
+  end
+end
+
+# translate an HTTP request → CGI env pairs
+def cgi_env_for(req)
+  pairs = {
+    'REQUEST_METHOD' => req.request_method,
+    'PATH_INFO'      => req.path,
+    'QUERY_STRING'   => (req.query_string || ''),
+    'CONTENT_LENGTH' => (req.body ? req.body.bytesize.to_s : '0'),
+    'CONTENT_TYPE'   => (req.content_type || ''),
+    'SERVER_PROTOCOL'=> 'HTTP/1.1',
+    'SPIN'           => '1'
+  }
+  # headers → HTTP_* (CGI convention)
+  req.each do |name, val|
+    key = 'HTTP_' + name.upcase.tr('-', '_')
+    pairs[key] = val
+  end
+  pairs
+end
+
+# parse a CGI response (status line + headers + blank + body) from stdout
+def parse_cgi_response(out)
+  status = 200
+  headers = {}
+  head, _, body = out.partition(/\r?\n\r?\n/)
+  head.each_line do |line|
+    line = line.strip
+    next if line.empty?
+    if line =~ /\AStatus:\s*(\d+)/i
+      status = Regexp.last_match(1).to_i
+    elsif line =~ /\A([^:]+):\s*(.*)\z/
+      headers[Regexp.last_match(1).strip] = Regexp.last_match(2).strip
+    end
+  end
+  headers['Content-Type'] ||= 'text/plain'
+  [status, headers, body]
+end
+
+server = WEBrick::HTTPServer.new(Port: PORT, Logger: WEBrick::Log.new($stderr, WEBrick::Log::WARN), AccessLog: [])
+
+server.mount_proc '/' do |req, res|
+  env_pairs = cgi_env_for(req)
+  cmd, child_env = invoke_command(env_pairs)
+  body_in = req.body || ''
+
+  t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  stdout, stderr, status = Open3.capture3(child_env, *cmd, stdin_data: body_in)
+  dt = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000).round(2)
+
+  unless status.success?
+    res.status = 500
+    res['Content-Type'] = 'text/plain'
+    res.body = "spin: handler exited #{status.exitstatus}\n\n#{stderr}"
+    next
+  end
+
+  code, headers, out_body = parse_cgi_response(stdout)
+  res.status = code
+  headers.each { |k, v| res[k] = v }
+  res['X-Spin-Handler-Ms'] = dt.to_s
+  res.body = out_body
+  warn "#{req.request_method} #{req.path} → #{code} (#{dt}ms)"
+end
+
+trap('INT')  { server.shutdown }
+trap('TERM') { server.shutdown }
+
+warn "spin: serving #{WASM ? 'wasm' : 'native'} handler #{HANDLER} on http://localhost:#{PORT}"
+server.start

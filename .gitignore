@@ -1,0 +1,8 @@
+# compiled artifacts (regenerated from handler.rb via spinel)
+/handler
+/handler.wasm
+*.c
+# toolchains
+wasi-sdk-*/
+*.tar.gz
+.DS_Store
