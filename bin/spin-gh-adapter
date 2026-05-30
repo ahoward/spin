@@ -1,0 +1,98 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# spin-gh-adapter — the GitHub-as-substrate adapter.
+#
+# the analog of spin-serve, but the transport is a GitHub issue instead of
+# HTTP. a GitHub Actions workflow is the ephemeral runtime (free compute);
+# this script is the issue→CGI→issue translation that the workflow invokes.
+#
+# it reads an issue/comment body on stdin, parses a small legible request
+# format out of it, maps that to the CGI contract, runs the handler, and
+# prints a markdown comment (the response) to stdout for the workflow to
+# post back.
+#
+# request format (human- and machine-legible) inside an issue/comment:
+#
+#   ```spin
+#   GET /hello
+#   ```
+#
+#   or with a body:
+#
+#   ```spin
+#   POST /echo
+#
+#   {"any":"body","after":"a blank line"}
+#   ```
+#
+# usage (inside the workflow):
+#   echo "$ISSUE_BODY" | spin-gh-adapter ./handler > comment.md
+#
+# this is the same handler used by spin-serve. only the adapter differs —
+# which is the whole point of the framework: transport-agnostic handlers.
+
+require 'open3'
+
+HANDLER = ARGV.shift or abort 'usage: spin-gh-adapter <handler> < issue_body'
+WASM    = ARGV.delete('--wasm')
+WASMTIME = ENV['WASMTIME'] || File.expand_path('~/.wasmtime/bin/wasmtime')
+
+body_in = $stdin.read
+
+# extract the ```spin ... ``` fenced block; ignore everything else in the issue
+fence = body_in[/```spin\s*\n(.*?)```/m, 1]
+unless fence
+  puts "**spin**: no ```​spin request block found in this issue.\n\n" \
+       "add one like:\n\n```\n```spin\nGET /hello\n```\n```"
+  exit 0
+end
+
+# first non-empty line is the request line: "METHOD /path"
+lines = fence.split("\n")
+req_line = lines.shift while lines.first && lines.first.strip.empty?
+req_line = lines.shift
+method, path = (req_line || 'GET /').strip.split(/\s+/, 2)
+method ||= 'GET'
+path   ||= '/'
+
+# body = everything after the first blank line following the request line
+rest = lines.join("\n")
+handler_body = rest.sub(/\A\s*\n/, '') # drop a leading blank separator
+handler_body = '' if handler_body.strip.empty?
+
+env_pairs = {
+  'REQUEST_METHOD' => method.upcase,
+  'PATH_INFO'      => path,
+  'CONTENT_LENGTH' => handler_body.bytesize.to_s,
+  'SPIN'           => '1',
+  'SPIN_TRANSPORT' => 'github-issue'
+}
+
+if WASM
+  cmd = [WASMTIME, 'run']
+  env_pairs.each { |k, v| cmd << '--env' << "#{k}=#{v}" }
+  cmd << HANDLER
+  child_env = {}
+else
+  cmd = [File.expand_path(HANDLER)]
+  child_env = env_pairs
+end
+
+t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+stdout, stderr, status = Open3.capture3(child_env, *cmd, stdin_data: handler_body)
+dt = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000).round(2)
+
+# render the handler's CGI output as a markdown comment to post back
+out = +"**spin** ran your request on free GitHub Actions compute.\n\n"
+out << "> `#{method.upcase} #{path}` · #{WASM ? 'wasm' : 'native'} · #{dt}ms\n\n"
+
+if status.success?
+  head, _, resp_body = stdout.partition(/\r?\n\r?\n/)
+  out << "**response**\n\n```\n#{head.strip}\n```\n\n"
+  out << "```\n#{resp_body.rstrip}\n```\n" unless resp_body.strip.empty?
+else
+  out << "**handler exited #{status.exitstatus}**\n\n```\n#{stderr.strip}\n```\n"
+end
+
+puts out

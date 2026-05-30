@@ -1,0 +1,83 @@
+# spin: GitHub-as-substrate transport.
+#
+# a GitHub issue (or comment) is the REQUEST. this workflow is the ephemeral
+# RUNTIME — free compute that spins up, compiles the handler, runs it against
+# the issue, posts the response back, and vanishes. the handler is the same
+# one spin-serve runs over HTTP; only the adapter changes.
+#
+# request format, inside an issue or comment body:
+#
+#     ```spin
+#     GET /hello
+#     ```
+#
+# or with a body after a blank line:
+#
+#     ```spin
+#     POST /echo
+#
+#     {"hello":"from an issue"}
+#     ```
+#
+# gate: only runs when the body contains a ```spin block (checked in-job),
+# and only for repo collaborators (the `if` on author_association) so it
+# isn't a free-compute faucet for strangers.
+
+name: spin-handler
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  issues: write          # to post the response comment
+  contents: read
+
+jobs:
+  run-handler:
+    runs-on: ubuntu-latest
+    # only collaborators/owners trigger compute; ignore everyone else
+    if: >
+      contains(github.event.issue.body, '```spin') ||
+      contains(github.event.comment.body, '```spin')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install spinel
+        run: |
+          # spinel is the AOT compiler; build it once per run (cacheable later)
+          git clone --depth 1 https://github.com/matz/spinel.git /tmp/spinel
+          cd /tmp/spinel
+          make deps
+          make
+          echo "/tmp/spinel" >> "$GITHUB_PATH"
+
+      - name: compile the handler
+        run: |
+          /tmp/spinel/spinel handler.rb -o ./handler
+          ls -la ./handler
+
+      - name: run the request through the handler
+        id: run
+        env:
+          # the issue or comment body, whichever triggered us
+          ISSUE_BODY: ${{ github.event.comment.body || github.event.issue.body }}
+        run: |
+          printf '%s' "$ISSUE_BODY" | ruby bin/spin-gh-adapter ./handler > /tmp/response.md
+          cat /tmp/response.md
+
+      - name: post the response back to the issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('/tmp/response.md', 'utf8');
+            const issue_number = context.issue.number;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body
+            });

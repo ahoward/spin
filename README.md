@@ -44,3 +44,25 @@ puts "Content-Type: text/plain"
 puts ""
 puts "hello"
 ```
+
+## github-as-substrate transport
+
+a GitHub issue can be the request; a workflow is the ephemeral runtime
+(free compute). same handler, different adapter.
+
+put this in an issue or comment:
+
+```
+```spin
+POST /echo
+
+{"hello":"from a github issue"}
+```
+```
+
+`.github/workflows/spin-handler.yml` fires, compiles the handler, runs your
+request via `bin/spin-gh-adapter`, and posts the response back as a comment.
+gated to collaborators so it isn't a free-compute faucet.
+
+verified locally (adapter logic); the workflow itself needs a pushed repo
+with Actions enabled to run live.
