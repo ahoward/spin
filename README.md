@@ -1,156 +1,99 @@
 # spin
 
-**the minimalist web framework for [spinel](https://github.com/matz/spinel).**
+minimalist web framework for [spinel](https://github.com/matz/spinel) (matz's
+ruby→native AOT compiler). write ruby, get a ~17KB binary that cold-starts in
+~1.5ms. talk to it over HTTP, a github issue, a tunnel, or the CLI — same
+handler, no socket, no server runtime.
 
-a handler is a small ruby program — `request → response` — that spinel
-compiles to a fast-starting artifact (native binary OR wasm). the contract
-is **the envelope: minimal HTTP/1.1**, both directions — a handler reads an
-http request on `stdin` and writes an http response on `stdout`. that makes a
-handler **transport-agnostic** (HTTP, github issue, tunnel, queue, the
-`spin call` CLI) and **host-agnostic** (laptop, container, edge isolate, free
-CI compute). see [docs/envelope.md](docs/envelope.md).
-
-see [PRD.md](PRD.md) for the concept and [docs/](docs/) for spike findings.
-
-## status: early spike. proven so far:
-
-- spinel compiles a GET/POST/405 handler → 17KB native binary, ~1.5ms cold
-  start. (`docs/spike-handler.md`)
-- same handler → `wasm32-wasi`, runs under wasmtime, identical CGI contract.
-  ~38 lines of runtime patches. (`docs/spike-hosting.md`)
-- `bin/spin-serve` — HTTP adapter. turns a handler (native or wasm) into a
-  real URL. native ~2.5ms/req; wasm ~14ms/req.
-- `bin/spin call` — CLI adapter. talk to a handler directly over the
-  envelope: `spin call ./notes read /notes/42`.
-- one envelope (`lib/spin/envelope.rb`), three transports (HTTP, github
-  issue, CLI) — the handler never changes.
-
-## try it
-
-```bash
-# requires spinel on PATH (https://github.com/matz/spinel)
-spinel handler.rb              # → ./handler (native)
-ruby bin/spin-serve ./handler  # → http://localhost:4242
-curl localhost:4242/hello
-curl -X POST -d 'hi' localhost:4242/submit
-
-# wasm path (requires wasi-sdk + wasmtime; see docs/spike-hosting.md)
-ruby bin/spin-serve --wasm ./handler.wasm
-```
-
-## the declarative resource DSL — reads like a spec, compiles like C
-
-write an app as a table of resources. it's **real ruby** — `resource`/`read`/
-`write` are DSL methods — but it is not compiled directly. `spin build`
-evaluates it at build time in full CRuby (unconstrained), codegens a
-spinel-compilable handler, and compiles that.
+## tl;dr
 
 ```ruby
-# examples/notes.rb
+# app.rb — a resource you talk to. read || write. that's the whole model.
 resource "notes" do
   read  { |req| reply(200, "all notes (id=#{resource_id(req)})") }
-  write { |req| reply(201, "wrote #{req["body"].length} bytes to notes") }
+  write { |req| reply(201, "wrote #{req["body"].length} bytes") }
 end
 
 resource "health" do
   read { |req| reply(200, "ok") }
 end
-
-resource "echo" do
-  write { |req| reply(200, req["body"]) }
-end
 ```
 
 ```bash
-spin build examples/notes.rb -o notes   # DSL → notes.spin.rb → spinel → ./notes
-spin build examples/notes.rb --gen-only # stop after codegen; inspect the .rb
+spin build app.rb -o notes        # ruby → spinel → ./notes (native binary)
+spin call ./notes read /notes/42  # → "all notes (id=42)"
+spin call ./notes write /notes <<< 'hi'
+ruby bin/spin-serve ./notes       # → http://localhost:4242
 ```
 
-a resource declaring only `read` is **read-only** (writes 405); only `write`
-is **write-only** (reads 404). both fall out of the table — no code for it.
+declare only `read` → read-only (writes 405). only `write` → write-only
+(reads 404). falls out of the table, no code for it.
 
-**why this is the good part.** the authoring language stops being constrained
-by what spinel compiles, because it's compiled to ruby *first*. the
-preprocessor (`lib/spin/dsl.rb` + `lib/spin/codegen.rb`) records the
-resource/read/write blocks, extracts each block body via Prism, and splices
-it into a `case resource(req)` dispatch — the boring compilable form. you can
-read the generated `*.spin.rb`; it's kept on disk, not hidden.
+## the envelope = minimal HTTP, both ways
 
-## the hand-written form (what the DSL compiles to)
-
-under the DSL is the plain resource model — you can write it directly when
-you don't want the preprocessor. a handler is a **resource you talk to**, not
-an HTTP endpoint. every message collapses to **read** (give me state) or
-**write** (change state). you write those two methods; the framework does the
-rest.
-
-```ruby
-require_relative "spin"
-
-def read(req)
-  case resource(req)
-  when "notes"  then reply(200, "all notes (id=#{resource_id(req)})")
-  when "health" then reply(200, "ok")
-  else               reply(404, "no such resource: #{req["path"]}")
-  end
-end
-
-def write(req)
-  case resource(req)
-  when "notes"  then reply(201, "created a note (#{req["body"].length} bytes)")
-  else               reply(405, "#{resource(req)} is read-only")
-  end
-end
-
-spin_run
-```
-
-- **read || write** is the whole verb model. HTTP GET → `read`; POST/PUT/
-  PATCH/DELETE → `write`; a github issue → `write`; a tunnel query → `read`.
-  the transport's native verb is collapsed to that one bit by the adapter.
-- **the request and response are one unified format** — a string→string bag.
-  `req["path"]`, `req["method"]`, `req["host"]`, `req["body"]`, any header:
-  just keys. `reply(status, body)` builds the response bag. headers aren't
-  special.
-- a resource with **no write branch is read-only** — the 405 falls out for
-  free.
-- **one binary, many resources** via `case resource(req)`; or one resource
-  per binary (spin's natural grain). both compile.
-
-surface in [`spin.rb`](spin.rb): `read`/`write` (yours) + `reply`,
-`reply_json`, `reply_html`, `resource`, `resource_id`, `spin_run`.
-AOT-compiles via spinel to a ~30KB binary. see
-[docs/dsl-exploration.md](docs/dsl-exploration.md) for the full design space
-(incl. a declarative `resource "notes" do … end` preprocessor, future).
-
-### why a resource model, not `get("/x") { ... }`
-
-two reasons. (1) spinel has no runtime proc-table — a sinatra-style block
-registry doesn't compile. (2) more importantly, "logical resource you talk
-to · read||write · headers are just strings · one data format" is a better
-model than HTTP-method-shaped routing: it's transport-agnostic by
-construction. the contract is the envelope (minimal http on stdin/stdout —
-[docs/envelope.md](docs/envelope.md)). use bare `gets`, not `STDIN.gets`
-(see docs/spike-handler.md).
-
-## github-as-substrate transport
-
-a GitHub issue can be the request; a workflow is the ephemeral runtime
-(free compute). same handler, different adapter.
-
-put this in an issue or comment:
+a handler reads an http request on stdin, writes an http response on stdout.
+no CGI, no env-mangling, no JSON parser. line-oriented text — which is all
+spinel can read. keys verbatim.
 
 ```
-```spin
-POST /echo
-
-{"hello":"from a github issue"}
+READ /notes/42          200 OK
+user-agent: curl/8.0    content-type: text/plain
+                        
+hello                   all notes
 ```
+
+request line takes spin verbs (`READ`/`WRITE`) **or** real http
+(`GET`/`POST`/...) — all collapse to read|write. so curl pipes straight in:
+
+```bash
+printf 'READ /health\n\n' | ./notes      # → 200 OK / ok
 ```
 
-`.github/workflows/spin-handler.yml` fires, compiles the handler, runs your
-request via `bin/spin-gh-adapter`, and posts the response back as a comment.
-gated to collaborators so it isn't a free-compute faucet.
+one encoder (`lib/spin/envelope.rb`), N transports. writing a new transport =
+build a bag, `Spin::Envelope.call`. spec: [docs/envelope.md](docs/envelope.md).
 
-verified locally (adapter logic); the workflow itself needs a pushed repo
-with Actions enabled to run live.
+## transports (same handler, different adapter)
+
+| transport | adapter | how |
+|---|---|---|
+| CLI | `bin/spin call` | `spin call ./h read /path` |
+| HTTP | `bin/spin-serve` | `spin-serve ./h` → URL; native ~2.5ms, wasm ~14ms |
+| github issue | `bin/spin-gh-adapter` + workflow | post a ` ```spin ` block, bot replies |
+| raw | the binary itself | `printf 'READ /x\n\n' \| ./h` |
+
+### github-as-substrate (issue = request, Action = free runtime)
+
+post in an issue/comment:
+
+    ```spin
+    READ /health
+    ```
+
+`.github/workflows/spin-handler.yml` fires, builds spinel (pinned), compiles
+the handler, runs it, posts back. **proven live** — issue→binary→reply in
+~2ms on a free runner. (gate is currently marker-only; real
+author_association check is [#10](../../issues/10).)
+
+## DSL → ruby → spinel (the trick)
+
+`app.rb` is real ruby; `resource`/`read`/`write` are DSL methods. `spin build`
+**evals it at build time in full CRuby** (unconstrained), then codegens a
+spinel-compilable handler (`app.spin.rb`, kept + inspectable) via Prism, then
+compiles that. ergonomics live in the DSL; compilability in the output.
+inspect it: `spin build app.rb --gen-only`.
+
+hand-written form (what the DSL emits) in [`spin.rb`](spin.rb) — `read`/
+`write` + `case resource(req)` + `reply`. write it directly if you want.
+
+## wasm / edge
+
+same handler → `wasm32-wasi` → runs under wasmtime, identical envelope.
+needs wasi-sdk + ~38 lines of runtime patch ([#2](../../issues/2)).
+[docs/spike-hosting.md](docs/spike-hosting.md).
+
+## status
+
+early spike, all core pieces proven (resource model, DSL, envelope, github
+transport live). built on spinel — which is days old and changes daily, so
+**pin your spinel commit** (the workflow does). open work: [issues](../../issues).
+docs: [PRD.md](PRD.md) · [docs/](docs/).
