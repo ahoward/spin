@@ -4,10 +4,11 @@
 
 a handler is a small ruby program — `request → response` — that spinel
 compiles to a fast-starting artifact (native binary OR wasm). the contract
-is CGI: request metadata in `ENV`, body on `stdin`, response on `stdout`.
-that makes a handler **transport-agnostic** (HTTP, github issue, tunnel,
-queue) and **host-agnostic** (laptop, container, edge isolate, free CI
-compute).
+is **the envelope: minimal HTTP/1.1**, both directions — a handler reads an
+http request on `stdin` and writes an http response on `stdout`. that makes a
+handler **transport-agnostic** (HTTP, github issue, tunnel, queue, the
+`spin call` CLI) and **host-agnostic** (laptop, container, edge isolate, free
+CI compute). see [docs/envelope.md](docs/envelope.md).
 
 see [PRD.md](PRD.md) for the concept and [docs/](docs/) for spike findings.
 
@@ -17,8 +18,12 @@ see [PRD.md](PRD.md) for the concept and [docs/](docs/) for spike findings.
   start. (`docs/spike-handler.md`)
 - same handler → `wasm32-wasi`, runs under wasmtime, identical CGI contract.
   ~38 lines of runtime patches. (`docs/spike-hosting.md`)
-- `bin/spin-serve` — HTTP→CGI adapter. turns a handler (native or wasm)
-  into a real URL. native ~2.5ms/req; wasm ~14ms/req.
+- `bin/spin-serve` — HTTP adapter. turns a handler (native or wasm) into a
+  real URL. native ~2.5ms/req; wasm ~14ms/req.
+- `bin/spin call` — CLI adapter. talk to a handler directly over the
+  envelope: `spin call ./notes read /notes/42`.
+- one envelope (`lib/spin/envelope.rb`), three transports (HTTP, github
+  issue, CLI) — the handler never changes.
 
 ## try it
 
@@ -124,8 +129,9 @@ two reasons. (1) spinel has no runtime proc-table — a sinatra-style block
 registry doesn't compile. (2) more importantly, "logical resource you talk
 to · read||write · headers are just strings · one data format" is a better
 model than HTTP-method-shaped routing: it's transport-agnostic by
-construction. the contract stays CGI under the hood: `ENV` + `stdin` →
-`stdout`. use bare `gets`, not `STDIN.gets` (see docs/spike-handler.md).
+construction. the contract is the envelope (minimal http on stdin/stdout —
+[docs/envelope.md](docs/envelope.md)). use bare `gets`, not `STDIN.gets`
+(see docs/spike-handler.md).
 
 ## github-as-substrate transport
 

@@ -89,33 +89,99 @@ def resource_id(req)
   ""
 end
 
-# --- the runner -----------------------------------------------------------
-# call `spin_run` at the very bottom of a handler, after read/write are
-# defined. builds the req bag from the CGI environment (ENV + stdin),
-# collapses the verb to read|write, dispatches, and emits the res bag.
+# --- the envelope: minimal HTTP/1.1, both directions ----------------------
+#
+# the wire format IS http. the handler reads an http request on stdin and
+# writes an http response on stdout. symmetric, standard, line-oriented (so
+# spinel can read it), keys verbatim (no SPIN_/CGI mangling).
+#
+# request in:                          response out:
+#   READ /notes/42                       200 OK
+#   user-agent: curl/8.0                 content-type: text/plain
+#   content-length: 5                    (blank)
+#   (blank)                              all notes
+#   hello
+#
+# the request line accepts BOTH spin verbs (READ/WRITE) and real http methods
+# (GET/POST/PUT/PATCH/DELETE) — any of them collapses to read|write. so a
+# literal curl request pipes straight in, and a hand-written `READ /x` works.
 
+# collapse any request-line method token to spin's read|write verb.
+def spin_verb(token)
+  t = token || "GET"
+  if t == "WRITE" || t == "write" || t == "POST" || t == "PUT" || t == "PATCH" || t == "DELETE"
+    "write"
+  else
+    "read" # READ, GET, HEAD, OPTIONS, anything else → read
+  end
+end
+
+# call `spin_run` at the bottom of a handler, after read/write are defined.
+# parses the http request from stdin into the req bag, dispatches by verb,
+# emits the res bag as an http response.
 def spin_run
   req = {}
-  req["method"] = ENV["REQUEST_METHOD"] || "GET"
-  req["path"]   = ENV["PATH_INFO"] || "/"
-  req["query"]  = ENV["QUERY_STRING"] || ""
-  req["host"]   = ENV["HTTP_HOST"] || ""
+  req["verb"] = "read"
+  req["path"] = "/"
 
+  first = 1
+  in_headers = 1
   body = ""
+
   while (line = gets)
-    body = body + line
+    ln = line.chomp
+    if first == 1
+      # request line: "<METHOD> <path>"
+      first = 0
+      sp = ln.index(" ")
+      if sp
+        req["verb"] = spin_verb(ln[0, sp])
+        rest = ln[(sp + 1), ln.length]
+        # drop a trailing " HTTP/1.1" if a real http client sent one
+        hsp = rest.index(" ")
+        req["path"] = hsp ? rest[0, hsp] : rest
+      else
+        req["verb"] = spin_verb(ln)
+      end
+    elsif in_headers == 1
+      if ln.length == 0
+        in_headers = 0
+      else
+        # "key: value" — split on the FIRST ": ", key verbatim (lowercased)
+        idx = ln.index(": ")
+        if idx
+          k = ln[0, idx]
+          v = ln[(idx + 2), ln.length]
+          req[k.downcase] = v
+        end
+      end
+    else
+      body = body + line
+    end
   end
   req["body"] = body
 
-  # the verb collapse: anything that mutates is a write; everything else
-  # is a read. transports map their native verb onto this before we run.
-  m = req["method"]
-  writing = (m == "POST" || m == "PUT" || m == "PATCH" || m == "DELETE")
+  res = (req["verb"] == "write") ? write(req) : read(req)
 
-  res = writing ? write(req) : read(req)
-
-  puts "Status: #{res["status"]}"
-  puts "Content-Type: #{res["content-type"]}"
+  # http response: status line + headers + blank + body.
+  puts "#{res["status"]} #{spin_status_text(res["status"])}"
+  puts "content-type: #{res["content-type"]}"
   puts ""
   puts res["body"]
+end
+
+# minimal reason-phrase for the status line. unknown codes → "".
+def spin_status_text(status)
+  case status
+  when "200" then "OK"
+  when "201" then "Created"
+  when "204" then "No Content"
+  when "400" then "Bad Request"
+  when "401" then "Unauthorized"
+  when "403" then "Forbidden"
+  when "404" then "Not Found"
+  when "405" then "Method Not Allowed"
+  when "500" then "Internal Server Error"
+  else ""
+  end
 end

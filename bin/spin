@@ -8,17 +8,50 @@
 #   spin build app.rb --gen-only   # stop after generating app.spin.rb
 #   spin build app.rb --wasm       # compile the generated handler to wasm
 #
-# the DSL source (app.rb) is real ruby using resource/read/write. `spin build`
-# evaluates it at build time (full CRuby), codegens a spinel-compilable
-# handler (app.spin.rb, kept on disk + inspectable), then invokes spinel.
+#   spin call ./handler read /notes/42         # talk to a handler directly
+#   spin call ./handler write /notes < body    # body from stdin
+#   spin call ./handler read /x -H 'k: v'       # add a header to the bag
+#   spin call --wasm ./h.wasm read /x           # call a wasm handler
+#
+# `spin call` is the CLI adapter — it speaks the envelope (minimal http)
+# directly, no HTTP server or github needed. it's the minimal proof that the
+# envelope IS the contract, and the dev-loop tool for poking a handler.
 
 require_relative '../lib/spin/codegen'
+require_relative '../lib/spin/envelope'
 
 SPINEL = ENV['SPINEL'] || 'spinel'  # spinel on PATH, or $SPINEL override
 
 def die(msg) = abort("spin: #{msg}")
 
 cmd = ARGV.shift
+die "usage: spin <build|call> ... (see bin/spin header)" unless cmd
+
+# --- spin call: the CLI adapter -------------------------------------------
+if cmd == 'call'
+  wasm = !!ARGV.delete('--wasm')
+  headers = {}
+  while (i = ARGV.index('-H'))
+    h = ARGV[i + 1] || die('-H needs "key: value"')
+    k, v = h.split(': ', 2)
+    headers[k.strip.downcase] = (v || '').strip
+    ARGV.delete_at(i + 1); ARGV.delete_at(i)
+  end
+  handler = ARGV.shift or die 'usage: spin call <handler> <read|write> <path> [-H "k: v"]'
+  verb    = ARGV.shift or die 'need a verb (read|write, or an http method)'
+  path    = ARGV.shift || '/'
+  body    = $stdin.tty? ? '' : $stdin.read
+
+  bag = headers.merge('verb' => verb, 'path' => path, 'body' => body)
+  res = Spin::Envelope.call(handler, bag, wasm: wasm)
+
+  # print the response bag as an http response (symmetric with the wire)
+  $stderr.puts "#{res['status']} · #{res['content-type']}"
+  print res['body']
+  print "\n" unless res['body'].to_s.end_with?("\n")
+  exit(res['status'].to_i >= 400 ? 1 : 0)
+end
+
 die "usage: spin build <app.rb> [-o name] [--gen-only] [--wasm]" unless cmd == 'build'
 
 src = ARGV.shift

@@ -32,11 +32,10 @@
 # this is the same handler used by spin-serve. only the adapter differs —
 # which is the whole point of the framework: transport-agnostic handlers.
 
-require 'open3'
+require_relative '../lib/spin/envelope'
 
 HANDLER = ARGV.shift or abort 'usage: spin-gh-adapter <handler> < issue_body'
-WASM    = ARGV.delete('--wasm')
-WASMTIME = ENV['WASMTIME'] || File.expand_path('~/.wasmtime/bin/wasmtime')
+WASM    = !!ARGV.delete('--wasm')
 
 body_in = $stdin.read
 
@@ -61,38 +60,23 @@ rest = lines.join("\n")
 handler_body = rest.sub(/\A\s*\n/, '') # drop a leading blank separator
 handler_body = '' if handler_body.strip.empty?
 
-env_pairs = {
-  'REQUEST_METHOD' => method.upcase,
-  'PATH_INFO'      => path,
-  'CONTENT_LENGTH' => handler_body.bytesize.to_s,
-  'SPIN'           => '1',
-  'SPIN_TRANSPORT' => 'github-issue'
+# build a request bag and hand it to the envelope (the github transport's
+# native verb is collapsed; issue context can be added as verbatim keys).
+bag = {
+  'verb'           => Spin::Envelope.collapse_verb(method),
+  'path'           => path,
+  'body'           => handler_body,
+  'spin-transport' => 'github-issue'
 }
 
-if WASM
-  cmd = [WASMTIME, 'run']
-  env_pairs.each { |k, v| cmd << '--env' << "#{k}=#{v}" }
-  cmd << HANDLER
-  child_env = {}
-else
-  cmd = [File.expand_path(HANDLER)]
-  child_env = env_pairs
-end
-
 t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-stdout, stderr, status = Open3.capture3(child_env, *cmd, stdin_data: handler_body)
-dt = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000).round(2)
+res = Spin::Envelope.call(HANDLER, bag, wasm: WASM)
+dt  = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000).round(2)
 
-# render the handler's CGI output as a markdown comment to post back
+# render the response bag as a markdown comment to post back
 out = +"**spin** ran your request on free GitHub Actions compute.\n\n"
 out << "> `#{method.upcase} #{path}` · #{WASM ? 'wasm' : 'native'} · #{dt}ms\n\n"
-
-if status.success?
-  head, _, resp_body = stdout.partition(/\r?\n\r?\n/)
-  out << "**response**\n\n```\n#{head.strip}\n```\n\n"
-  out << "```\n#{resp_body.rstrip}\n```\n" unless resp_body.strip.empty?
-else
-  out << "**handler exited #{status.exitstatus}**\n\n```\n#{stderr.strip}\n```\n"
-end
+out << "**response** `#{res['status']}` · `#{res['content-type']}`\n\n"
+out << "```\n#{res['body'].to_s.rstrip}\n```\n"
 
 puts out
