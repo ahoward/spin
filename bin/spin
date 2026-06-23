@@ -1,0 +1,74 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# spin — the spin CLI.
+#
+#   spin build app.rb              # app.rb (resource DSL) → app.spin.rb → binary
+#   spin build app.rb -o myapp     # name the output binary
+#   spin build app.rb --gen-only   # stop after generating app.spin.rb
+#   spin build app.rb --wasm       # compile the generated handler to wasm
+#
+# the DSL source (app.rb) is real ruby using resource/read/write. `spin build`
+# evaluates it at build time (full CRuby), codegens a spinel-compilable
+# handler (app.spin.rb, kept on disk + inspectable), then invokes spinel.
+
+require_relative '../lib/spin/codegen'
+
+SPINEL = ENV['SPINEL'] || 'spinel'  # spinel on PATH, or $SPINEL override
+
+def die(msg) = abort("spin: #{msg}")
+
+cmd = ARGV.shift
+die "usage: spin build <app.rb> [-o name] [--gen-only] [--wasm]" unless cmd == 'build'
+
+src = ARGV.shift
+die "no source file" unless src
+die "not found: #{src}" unless File.exist?(src)
+
+gen_only = !!ARGV.delete('--gen-only')
+wasm     = !!ARGV.delete('--wasm')
+out_name = nil
+if (i = ARGV.index('-o'))
+  out_name = ARGV[i + 1]
+  ARGV.delete_at(i + 1); ARGV.delete_at(i)
+end
+
+# 1. load the DSL (eval the source in the recorder context)
+dsl = Spin::DSL.load(src)
+die "no `resource` declarations in #{src}" if dsl.resources.empty?
+
+# 2. codegen the compilable handler next to the source
+base    = File.basename(src, '.rb')
+dir     = File.dirname(src)
+gen_path = File.join(dir, "#{base}.spin.rb")
+# the generated file requires spin.rb; make the path relative to the gen dir.
+spin_rb = File.expand_path(File.join(__dir__, '..', 'spin.rb'))
+prelude = relative_require(gen_path, spin_rb)
+
+source = Spin::Codegen.generate(dsl, prelude_path: prelude)
+File.write(gen_path, source)
+warn "spin: generated #{gen_path} (#{dsl.resources.size} resource#{'s' unless dsl.resources.size == 1})"
+
+if gen_only
+  puts gen_path
+  exit 0
+end
+
+# 3. invoke spinel on the generated handler
+out_name ||= base
+spinel_args = [SPINEL, gen_path, '-o', out_name]
+spinel_args << '-c' if wasm   # wasm path: emit C, then the caller compiles it
+warn "spin: #{spinel_args.join(' ')}"
+system(*spinel_args) or die "spinel failed"
+warn "spin: built ./#{out_name}"
+
+# helper: how should a file at `from` require_relative a file at `to`?
+BEGIN {
+  def relative_require(from, to)
+    require 'pathname'
+    from_dir = Pathname.new(File.expand_path(File.dirname(from)))
+    to_abs   = Pathname.new(File.expand_path(to))
+    rel = to_abs.relative_path_from(from_dir)
+    rel.to_s.sub(/\.rb\z/, '')
+  end
+}

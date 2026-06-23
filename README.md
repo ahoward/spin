@@ -33,11 +33,51 @@ curl -X POST -d 'hi' localhost:4242/submit
 ruby bin/spin-serve --wasm ./handler.wasm
 ```
 
-## the handler — sinatra-flat, compiles to C
+## the declarative resource DSL — reads like a spec, compiles like C
 
-a handler is a **resource you talk to**, not an HTTP endpoint. every message
-collapses to **read** (give me state) or **write** (change state). you write
-those two methods; the framework does the rest.
+write an app as a table of resources. it's **real ruby** — `resource`/`read`/
+`write` are DSL methods — but it is not compiled directly. `spin build`
+evaluates it at build time in full CRuby (unconstrained), codegens a
+spinel-compilable handler, and compiles that.
+
+```ruby
+# examples/notes.rb
+resource "notes" do
+  read  { |req| reply(200, "all notes (id=#{resource_id(req)})") }
+  write { |req| reply(201, "wrote #{req["body"].length} bytes to notes") }
+end
+
+resource "health" do
+  read { |req| reply(200, "ok") }
+end
+
+resource "echo" do
+  write { |req| reply(200, req["body"]) }
+end
+```
+
+```bash
+spin build examples/notes.rb -o notes   # DSL → notes.spin.rb → spinel → ./notes
+spin build examples/notes.rb --gen-only # stop after codegen; inspect the .rb
+```
+
+a resource declaring only `read` is **read-only** (writes 405); only `write`
+is **write-only** (reads 404). both fall out of the table — no code for it.
+
+**why this is the good part.** the authoring language stops being constrained
+by what spinel compiles, because it's compiled to ruby *first*. the
+preprocessor (`lib/spin/dsl.rb` + `lib/spin/codegen.rb`) records the
+resource/read/write blocks, extracts each block body via Prism, and splices
+it into a `case resource(req)` dispatch — the boring compilable form. you can
+read the generated `*.spin.rb`; it's kept on disk, not hidden.
+
+## the hand-written form (what the DSL compiles to)
+
+under the DSL is the plain resource model — you can write it directly when
+you don't want the preprocessor. a handler is a **resource you talk to**, not
+an HTTP endpoint. every message collapses to **read** (give me state) or
+**write** (change state). you write those two methods; the framework does the
+rest.
 
 ```ruby
 require_relative "spin"
