@@ -46,10 +46,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: install spinel
+        env:
+          # spinel is days old and changes daily; HEAD regressed bare `gets`
+          # (which spin_run uses) between f7602f4 and ad2b71a. PIN to a known-
+          # good commit so the build is reproducible. bump deliberately. see
+          # issue #1 (spinel stdlib reach).
+          SPINEL_REF: f7602f4
         run: |
-          # spinel is the AOT compiler; build it once per run (cacheable later)
-          git clone --depth 1 https://github.com/matz/spinel.git /tmp/spinel
+          git clone https://github.com/matz/spinel.git /tmp/spinel
           cd /tmp/spinel
+          git checkout "$SPINEL_REF"
           make deps
           make
           echo "/tmp/spinel" >> "$GITHUB_PATH"
