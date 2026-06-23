@@ -35,37 +35,57 @@ ruby bin/spin-serve --wasm ./handler.wasm
 
 ## the handler — sinatra-flat, compiles to C
 
+a handler is a **resource you talk to**, not an HTTP endpoint. every message
+collapses to **read** (give me state) or **write** (change state). you write
+those two methods; the framework does the rest.
+
 ```ruby
 require_relative "spin"
 
-method, path = spin_request
-
-if spin_get?(method, path, "/")
-  spin_text(200, "hello from spin")
-
-elsif spin_get?(method, path, "/hi/:name")
-  spin_text(200, "hi #{spin_param("/hi/:name", path)}")
-
-elsif spin_post?(method, path, "/echo")
-  spin_text(201, "you said: #{spin_body}")
-
-else
-  spin_text(404, "not found: #{method} #{path}")
+def read(req)
+  case resource(req)
+  when "notes"  then reply(200, "all notes (id=#{resource_id(req)})")
+  when "health" then reply(200, "ok")
+  else               reply(404, "no such resource: #{req["path"]}")
+  end
 end
+
+def write(req)
+  case resource(req)
+  when "notes"  then reply(201, "created a note (#{req["body"].length} bytes)")
+  else               reply(405, "#{resource(req)} is read-only")
+  end
+end
+
+spin_run
 ```
 
-the whole routing surface is in [`spin.rb`](spin.rb): `spin_request`,
-`spin_get?/post?/put?/delete?`, `spin_match?`, `spin_param`, `spin_body`,
-`spin_text/json/html`. it reads like sinatra and AOT-compiles via spinel to
-a ~26KB binary.
+- **read || write** is the whole verb model. HTTP GET → `read`; POST/PUT/
+  PATCH/DELETE → `write`; a github issue → `write`; a tunnel query → `read`.
+  the transport's native verb is collapsed to that one bit by the adapter.
+- **the request and response are one unified format** — a string→string bag.
+  `req["path"]`, `req["method"]`, `req["host"]`, `req["body"]`, any header:
+  just keys. `reply(status, body)` builds the response bag. headers aren't
+  special.
+- a resource with **no write branch is read-only** — the 405 falls out for
+  free.
+- **one binary, many resources** via `case resource(req)`; or one resource
+  per binary (spin's natural grain). both compile.
 
-### why if/elsif and not `get("/x") { ... }`
+surface in [`spin.rb`](spin.rb): `read`/`write` (yours) + `reply`,
+`reply_json`, `reply_html`, `resource`, `resource_id`, `spin_run`.
+AOT-compiles via spinel to a ~30KB binary. see
+[docs/dsl-exploration.md](docs/dsl-exploration.md) for the full design space
+(incl. a declarative `resource "notes" do … end` preprocessor, future).
 
-spinel infers homogeneous, typed structures and has no runtime proc-table.
-a sinatra-style block registry doesn't compile. the flat if/elsif dispatch
-is the closest thing that does — same legibility, no runtime indirection.
-the contract stays CGI: `ENV` (request meta) + `stdin` (body) → `stdout`
-(response). use bare `gets`, not `STDIN.gets` (see docs/spike-handler.md).
+### why a resource model, not `get("/x") { ... }`
+
+two reasons. (1) spinel has no runtime proc-table — a sinatra-style block
+registry doesn't compile. (2) more importantly, "logical resource you talk
+to · read||write · headers are just strings · one data format" is a better
+model than HTTP-method-shaped routing: it's transport-agnostic by
+construction. the contract stays CGI under the hood: `ENV` + `stdin` →
+`stdout`. use bare `gets`, not `STDIN.gets` (see docs/spike-handler.md).
 
 ## github-as-substrate transport
 

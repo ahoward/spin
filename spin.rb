@@ -1,120 +1,121 @@
-# spin.rb — the routing layer. require this from a handler.
+# spin.rb — the resource prelude. require this at the top of a handler.
 #
-# the simplicity bar is sinatra / lib/site.rb: a route is a method + a path
-# + what to do. but a spin handler is AOT-compiled by spinel, so routing
-# runs INSIDE the compiled binary and must use only what spinel compiles.
-# spinel infers homogeneous typed structures and does not do runtime
-# proc-tables — so spin's routing is built from plain helpers and a flat
-# if/elsif dispatch, not a registry of blocks.
+# the model: a handler is a RESOURCE you talk to, not an HTTP endpoint. every
+# message collapses to READ (give me state) or WRITE (change state). the
+# transport's verb — HTTP GET/POST/…, a github issue, a tunnel query — is an
+# implementation detail the adapter collapses to that one bit. headers,
+# query params, issue fields are not special; they're just more string keys
+# in the request bag. request and response share one unified format: a
+# string→string bag.
 #
-# you write (handler.rb):
+# a handler is therefore just:
 #
 #     require_relative "spin"
 #
-#     method, path = spin_request
-#
-#     if    spin_get?(method, path, "/")            then spin_text(200, "hello")
-#     elsif spin_get?(method, path, "/hi/:name")    then spin_text(200, "hi #{spin_param("/hi/:name", path)}")
-#     elsif spin_post?(method, path, "/echo")       then spin_text(201, "you said: #{spin_body}")
-#     else                                                spin_text(404, "not found: #{path}")
+#     def read(req)
+#       reply(200, "reading #{req["path"]}")
 #     end
 #
-# that is the whole framework surface. five helpers + a request reader.
-# it reads like sinatra, it compiles like C.
+#     def write(req)
+#       reply(201, "wrote #{req["body"].length} bytes")
+#     end
+#
+#     spin_run
+#
+# that's the whole surface. no get?/post?/path-matching ceremony. for one
+# binary serving several logical resources, branch on `resource(req)` inside
+# read/write (see docs/dsl-exploration.md, Option B). a resource that defines
+# no write branch is read-only — 405 falls out for free.
+#
+# constraints honored (spinel AOT): string→string Hash, case/when on strings,
+# methods taking/returning a hash, bare `gets`. no runtime proc-tables.
 
-# --- request --------------------------------------------------------------
+# --- response bag builders ------------------------------------------------
 
-# read the request line: [method, path]. ENV carries metadata (CGI contract).
-def spin_request
-  method = ENV["REQUEST_METHOD"] || "GET"
-  path   = ENV["PATH_INFO"] || "/"
-  [method, path]
+# build a response bag. status + body, plus a content type (default text).
+def reply(status, body)
+  res = {}
+  res["status"]       = "#{status}"
+  res["content-type"] = "text/plain"
+  res["body"]         = body
+  res
 end
 
-# read the whole request body from stdin (bare gets — STDIN.gets unsupported).
-def spin_body
-  body = ""
-  while (line = gets)
-    body = body + line
-  end
-  body
+def reply_json(status, body)
+  res = {}
+  res["status"]       = "#{status}"
+  res["content-type"] = "application/json"
+  res["body"]         = body
+  res
 end
 
-# --- matching --------------------------------------------------------------
+def reply_html(status, body)
+  res = {}
+  res["status"]       = "#{status}"
+  res["content-type"] = "text/html"
+  res["body"]         = body
+  res
+end
 
-# does `pattern` (e.g. "/hi/:name") match `path` (e.g. "/hi/bob")?
-# segment-by-segment; ":name" segments match any single segment.
-def spin_match?(pattern, path)
-  pp = pattern.split("/")
-  ps = path.split("/")
-  return false if pp.length != ps.length
+# --- request helpers ------------------------------------------------------
+
+# the first non-empty path segment — the logical resource name.
+# "/notes/42" → "notes"; "/" → "".
+def resource(req)
+  parts = req["path"].split("/")
   i = 0
-  while i < pp.length
-    seg = pp[i]
-    got = ps[i]
-    if seg.length > 0 && seg[0] == ":"
-      # param segment — matches anything non-empty
-      return false if got.length == 0
-    elsif seg != got
-      return false
-    end
+  while i < parts.length
+    seg = parts[i]
+    return seg if seg.length > 0
     i = i + 1
   end
-  true
+  ""
 end
 
-# extract the value of the FIRST :param in `pattern` from `path`.
-# (one param per route keeps it spinel-simple; multi-param is an issue.)
-def spin_param(pattern, path)
-  pp = pattern.split("/")
-  ps = path.split("/")
-  return "" if pp.length != ps.length
+# the path segment after the resource name — the resource id, if any.
+# "/notes/42" → "42"; "/notes" → "".
+def resource_id(req)
+  parts = req["path"].split("/")
+  seen = 0
   i = 0
-  while i < pp.length
-    seg = pp[i]
-    if seg.length > 0 && seg[0] == ":"
-      return ps[i]
+  while i < parts.length
+    seg = parts[i]
+    if seg.length > 0
+      seen = seen + 1
+      return seg if seen == 2
     end
     i = i + 1
   end
   ""
 end
 
-# method+path predicates — the sinatra-flat verbs.
-def spin_get?(method, path, pattern)
-  method == "GET" && spin_match?(pattern, path)
-end
+# --- the runner -----------------------------------------------------------
+# call `spin_run` at the very bottom of a handler, after read/write are
+# defined. builds the req bag from the CGI environment (ENV + stdin),
+# collapses the verb to read|write, dispatches, and emits the res bag.
 
-def spin_post?(method, path, pattern)
-  method == "POST" && spin_match?(pattern, path)
-end
+def spin_run
+  req = {}
+  req["method"] = ENV["REQUEST_METHOD"] || "GET"
+  req["path"]   = ENV["PATH_INFO"] || "/"
+  req["query"]  = ENV["QUERY_STRING"] || ""
+  req["host"]   = ENV["HTTP_HOST"] || ""
 
-def spin_put?(method, path, pattern)
-  method == "PUT" && spin_match?(pattern, path)
-end
+  body = ""
+  while (line = gets)
+    body = body + line
+  end
+  req["body"] = body
 
-def spin_delete?(method, path, pattern)
-  method == "DELETE" && spin_match?(pattern, path)
-end
+  # the verb collapse: anything that mutates is a write; everything else
+  # is a read. transports map their native verb onto this before we run.
+  m = req["method"]
+  writing = (m == "POST" || m == "PUT" || m == "PATCH" || m == "DELETE")
 
-# --- response --------------------------------------------------------------
+  res = writing ? write(req) : read(req)
 
-# emit a CGI response: status line + headers + blank + body.
-def spin_respond(status, content_type, body)
-  puts "Status: #{status}"
-  puts "Content-Type: #{content_type}"
+  puts "Status: #{res["status"]}"
+  puts "Content-Type: #{res["content-type"]}"
   puts ""
-  puts body
-end
-
-def spin_text(status, body)
-  spin_respond(status, "text/plain", body)
-end
-
-def spin_json(status, body)
-  spin_respond(status, "application/json", body)
-end
-
-def spin_html(status, body)
-  spin_respond(status, "text/html", body)
+  puts res["body"]
 end
